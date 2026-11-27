@@ -371,6 +371,15 @@ static inline unsigned nvrmSurroundOffset(const unsigned *widths, unsigned m) { 
 // starts a framebuffer for a display that appears). 6 tries, then it stays quiet like before. 0 = stop.
 enum { kNvrmBootRetries = 6 };
 static inline unsigned nvrmBootRetryDelayMs(unsigned attempt) { return attempt < kNvrmBootRetries ? 3000u : 0u; }
+// Display wake retries: a monitor waking from standby can still be bringing up its DP link or HDMI 2.1 FRL
+// training when IOPM delivers setPowerState(1), so the first modeset is refused. Retry on a bounded ramp (~20 s),
+// then stay quiet and let hot-plug relight the head if the monitor comes back later. 0 = stop.
+enum { kNvrmWakeRetries = 9 };
+static inline unsigned nvrmWakeRetryDelayMs(unsigned attempt)
+{
+    static const unsigned ms[kNvrmWakeRetries] = { 500, 1000, 1500, 2000, 2500, 2500, 3000, 3000, 4000 };
+    return attempt < kNvrmWakeRetries ? ms[attempt] : 0u;
+}
 // The master of a surround mask is its lowest connected index; a member is any other connected index in the mask.
 static inline unsigned nvrmSurroundMaster(unsigned mask, unsigned connected) { for (unsigned i = 0; i < 8 && i < connected; i++) if (mask & (1u << i)) return i; return 8; }
 static inline bool nvrmSurroundIsMember(unsigned mask, unsigned index, unsigned connected)
