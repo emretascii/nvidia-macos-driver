@@ -785,9 +785,14 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // framebuffer through callPlatformFunction("NVRMGpuPower"). The head is lit again only once the GPU is back.
     bool fPowerOn = true;                 // this framebuffer's own power state (display sleep / system sleep)
     bool fSysSlept = false;               // NVRM put the GPU in standby since this framebuffer last powered on
+    bool fHotplugDeferred = false;        // a display-change event arrived while asleep; probe once awake
 
     thread_call_t fGpuWake = nullptr;
     static void gpuWakeFire(thread_call_param_t p0, thread_call_param_t);
+    thread_call_t fWakeRetry = nullptr;
+    unsigned fWakeRetries = 0;
+    void scheduleWakeRetry();
+    static void wakeRetryFire(thread_call_param_t p0, thread_call_param_t);
     bool rmGpuReady();
     void familyDidWake();
     IOReturn familyDidWakeGated(void *, void *, void *, void *);
@@ -1994,12 +1999,30 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     if (!dd) return;
     int added = 0;
     NVRMNVDAFramebuffer *relight[16]; unsigned nrelight = 0;
+    NVRMNVDAFramebuffer *rewake[16]; unsigned nrewake = 0;
     NVRMNVDAFramebuffer *notify[16]; unsigned nnotify = 0;
     IORecursiveLock *sl = startLock();
     if (sl) IORecursiveLockLock(sl);
     for (NvU32 i = 0; i < n; i++) {
         bool known = false; int kdpy = -1;
         for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; kdpy = k; break; }
+        if (known) {
+            // Do not probe a known display while its head is in DPMS sleep: an HPD pulse during standby
+            // makes NVKMS run HDMI 2.1 FRL link assessment against a sleeping sink, which times out and
+            // wipes its FRL capabilities before the real wake commit arrives. Defer until setPowerState(1).
+            bool sleeping = false;
+            for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
+                NVRMNVDAFramebuffer *fb = gFBs[f];
+                if (fb && fb->fDisplay == handles[i] && !fb->fPowerOn && fb->fHeadSlept) {
+                    fb->fHotplugDeferred = true;
+                    sleeping = true;
+                }
+            }
+            if (sleeping) {
+                FBLOG("hot-plug: display 0x%x changed while asleep -- deferring probe until wake", handles[i]);
+                continue;
+            }
+        }
         nvu_zero(dd, sizeof *dd); dd->handle = handles[i];
         bool dynOk = nvrmDynamicDisplayInfo(me->fKms, me->fDev, dd);
         if (known) {
@@ -2053,6 +2076,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                     if (nrelight < sizeof relight / sizeof relight[0]) {
                         fb->retain(); relight[nrelight++] = fb;
                     }
+                } else if (fb->fPowerOn && fb->fHeadSlept && fb->fModeSet && fb->fSurf) {
+                    if (audioTypeChanged) fb->publishDisplayAudioProperties();
+                    if (nrewake < sizeof rewake / sizeof rewake[0]) {
+                        fb->retain(); rewake[nrewake++] = fb;
+                    }
                 } else if (audioTypeChanged) fb->publishDisplayAudioProperties();
             }
             continue;
@@ -2090,7 +2118,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         }
     }
     for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; ++i)
-        if (gFBs[i] && !gFBs[i]->fDpyLost) gFBs[i]->publishDisplayAudioProperties();
+        if (gFBs[i] && !gFBs[i]->fDpyLost && gFBs[i]->fPowerOn) gFBs[i]->publishDisplayAudioProperties();
     if (sl) IORecursiveLockUnlock(sl);
     IOFree(dd, sizeof *dd);
     for (unsigned f = 0; f < nnotify; f++) {
@@ -2099,7 +2127,9 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     }
     for (unsigned f = 0; f < nrelight; f++) {
         NVRMNVDAFramebuffer *fb = relight[f];
-        bool ok = !OSAddAtomic(0, &fb->fStopping) && !fb->fHeadSlept && fb->reflip();
+        bool ok = false;
+        if (!OSAddAtomic(0, &fb->fStopping) && fb->fPowerOn)
+            ok = fb->fHeadSlept ? fb->setHeadPower(true) : fb->reflip();
         FBLOG("hot-plug: display 0x%x is back (fb %u): head %u lit again -> ok %u rc %d",
               fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
         if (!OSAddAtomic(0, &fb->fStopping) && !fb->fDpyLost) {
@@ -2113,6 +2143,16 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             }
             fb->fRelightAudioValid = false;
             fb->notifyConnectionChanged(500);
+        }
+        fb->release();
+    }
+    for (unsigned f = 0; f < nrewake; f++) {
+        NVRMNVDAFramebuffer *fb = rewake[f];
+        NVRMDisplayGate gate;
+        if (gate.valid() && !OSAddAtomic(0, &fb->fStopping) && fb->fPowerOn && fb->fHeadSlept) {
+            const bool ok = fb->setHeadPower(true);
+            FBLOG("hot-plug: display 0x%x waking head %u -> ok %u rc %d",
+                  fb->fDisplay, fb->fHead, (unsigned)ok, fb->fReflipRc);
         }
         fb->release();
     }
@@ -3144,6 +3184,7 @@ bool NVRMNVDAFramebuffer::applyMode()
     }
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     fModeSet = ok;
+    if (ok) { fHeadSlept = false; fWakeRetries = 0; }
     fCurShownKnown = false;   // the mode set named no cursor
     publishFlipWait();
     fHwVblTries = 0;
@@ -3311,6 +3352,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
                                        : fHwVblWanted ? "deferred until NVKMS latches a flip on this head" : "not available - the timer stays the VBL");
     fReflip = nvrmfbCall(reflipFire, this);
     fGpuWake = nvrmfbCall(gpuWakeFire, this);
+    fWakeRetry = nvrmfbCall(wakeRetryFire, this);
     FBLOG("reflip keep-alive NOT armed: enableController's modeset owns the head, no boot-time re-syncs");
     fBars = nvrmfbCall(barsFire, this);
     uint32_t hudGate = 0;
@@ -3368,7 +3410,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         if (sl) IORecursiveLockUnlock(sl);
         if (mine) release();
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall, &fConnectNotify, &fAudioCall};
+    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fWakeRetry, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall, &fConnectNotify, &fAudioCall};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;
@@ -3562,14 +3604,27 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
         result = dtIndex(mode) >= 0 ? switchSurround(mode) : kIOReturnUnsupportedMode;
     } else if (mode == kModeId) {
         fPendingScaled = false;
-        result = fCurId == kModeId
-            ? (applyMode() ? kIOReturnSuccess : kIOReturnError)
-            : (fHdrWant = false, switchMode(kModeId, fBootMode, fBootW, fBootH, 0));
+        if (fCurId == kModeId) {
+            if (fModeSet) {
+                if (fHeadSlept && fPowerOn) (void)setHeadPower(true);
+                result = kIOReturnSuccess;
+            } else {
+                result = applyMode() ? kIOReturnSuccess : kIOReturnError;
+            }
+        } else {
+            fHdrWant = false;
+            result = switchMode(kModeId, fBootMode, fBootW, fBootH, 0);
+        }
     } else {
         int i = dtIndex(mode);
         if (i < 0) return kIOReturnUnsupportedMode;
         if (mode == fCurId && dtIsCurrent(fDT[i])) {
-            result = fModeSet ? kIOReturnSuccess : (applyMode() ? kIOReturnSuccess : kIOReturnError);
+            if (fModeSet) {
+                if (fHeadSlept && fPowerOn) (void)setHeadPower(true);
+                result = kIOReturnSuccess;
+            } else {
+                result = applyMode() ? kIOReturnSuccess : kIOReturnError;
+            }
         } else {
             struct NvKmsKapiDisplayMode m = {};
             if (!edidModeFor(&fDT[i], &m)) dtToKapi(&fDT[i], &m);
@@ -3988,7 +4043,7 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     struct NvKmsKapiSurface *old = fSurf;
     fScan30 = ten;
     fSurf = ns; fFrontSurf = shown; fMode = m; fW = w; fH = h; fPitch = pitch;
-    fRasterW = m.timings.hVisible; fRasterH = m.timings.vVisible; fCurId = id; fModeSet = true; fModeSwitches++;
+    fRasterW = m.timings.hVisible; fRasterH = m.timings.vVisible; fCurId = id; fModeSet = true; fHeadSlept = false; fWakeRetries = 0; fModeSwitches++;
     fCurShownKnown = false;   // the mode set named no cursor
     publishFlipWait();
     fHwVblTries = 0;   // a new mode gets its own hardware-vblank tries (fModeSet stays set, so vblFire would not reset them)
@@ -4255,7 +4310,7 @@ IOReturn NVRMNVDAFramebuffer::switchSurround(IODisplayModeID id)
     if (!ok) { if (!fSubmissionFaulted) fKms->destroySurface(fDev, ns); return kIOReturnUnsupportedMode; }
     struct NvKmsKapiSurface *old = fSurf;
     fSurf = ns; fFrontSurf = ns; fSurActive = true; fMode = fSur[0].mode; fW = w; fH = h; fPitch = pitch;
-    fRasterW = w; fRasterH = h; fCurId = id; fModeSet = true; fModeSwitches++; fCurShownKnown = false;
+    fRasterW = w; fRasterH = h; fCurId = id; fModeSet = true; fHeadSlept = false; fWakeRetries = 0; fModeSwitches++; fCurShownKnown = false;
     publishFlipWait(); fHwVblTries = 0; fCurTransform = 0;
     if (old && old != ns) fKms->destroySurface(fDev, old);
     return kIOReturnSuccess;
@@ -5418,7 +5473,7 @@ bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
         }
         const bool ok = reflip();
         // A rejected wake must remain retryable on the next power request.
-        if (ok) { fHeadSlept = false; publishDisplayAudioProperties(); }
+        if (ok) { fHeadSlept = false; fWakeRetries = 0; publishDisplayAudioProperties(); }
         FBLOG("display wake: head %u mode and surface committed again -> %s (rc %d)", fHead, ok ? "ok" : "FAILED", fReflipRc);
         return ok;
     }
@@ -5439,9 +5494,12 @@ IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *de
     ddcSetPowered(ordinal != 0);
     if (ordinal) {
         fPowerOn = true;
-        // a failed wake stays retryable (fHeadSlept kept) but WindowServer is still told the display is on, as 1.14.7 did:
-        // without the notification it never redraws, and the head can sit black with nothing left to retry it (review)
-        (void)setHeadPower(true);
+        fWakeRetries = 0;
+        // a failed wake stays retryable (fHeadSlept kept) and schedules bounded retries, while WindowServer is still
+        // told the display is on, as 1.14.7 did: without the notification it never redraws, and without retries a
+        // monitor whose link or HDMI FRL training was still settling at wake stays dark forever
+        if (!setHeadPower(true)) scheduleWakeRetry();
+        if (fHotplugDeferred) { fHotplugDeferred = false; hotplugKick(); }
         // A system sleep cleared pagingState (IOGraphics' system work, with kIOFBNotifyWillSleep to every client).
         // This override replaces IOFramebuffer::setPowerState, so the family's wake work never runs, and
         // handleEvent() does nothing off the controller's power thread - so no client ever saw kIOFBNotifyDidWake,
@@ -5454,6 +5512,7 @@ IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *de
     } else {
         handleEvent(kIOFBNotifyWillPowerOff);
         fPowerOn = false;
+        fWakeRetries = 0;
         (void)setHeadPower(false);
     }
     return kIOPMAckImplied;
@@ -5556,8 +5615,56 @@ void NVRMNVDAFramebuffer::gpuWakeFire(thread_call_param_t p0, thread_call_param_
         FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
         return;
     }
+    me->fWakeRetries = 0;
     const bool ok = me->setHeadPower(true);   // a rejected wake stays retryable on the next power request
     FBLOG("GPU back: head %u re-lit -> %s", me->fHead, ok ? "ok" : "FAILED");
+    if (!ok) me->scheduleWakeRetry();
+}
+void NVRMNVDAFramebuffer::scheduleWakeRetry()
+{
+    if (!fWakeRetry || !fPowerOn || !fHeadSlept || !fModeSet || !fSurf || OSAddAtomic(0, &fStopping)) return;
+    if (!rmGpuReady()) return;
+    const unsigned attempt = fWakeRetries;
+    const unsigned ms = nvrmWakeRetryDelayMs(attempt);
+    if (!ms) {
+        FBLOG("display wake: head %u still dark after %u retries; waiting for a display-change event", fHead, attempt);
+        return;
+    }
+    fWakeRetries = attempt + 1;
+    uint64_t deadline; clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+    scheduleCall(fWakeRetry, deadline);
+    FBLOG("display wake: head %u retry %u/%u scheduled in %u ms", fHead, fWakeRetries, (unsigned)kNvrmWakeRetries, ms);
+}
+void NVRMNVDAFramebuffer::wakeRetryFire(thread_call_param_t p0, thread_call_param_t)
+{
+    NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
+    NVRMCallReference callReference(me);
+    if (OSAddAtomic(0, &me->fStopping)) return;
+    if (!me->fPowerOn || !me->fHeadSlept || !me->fModeSet || !me->fSurf || !me->rmGpuReady()) return;
+    // Refresh NVKMS's view of the waking connector outside NVRMDisplayGate (under startLock, matching hotplugFire)
+    // so link/FRL/DSC capabilities settle before the next modeset commit.
+    bool connected = true;
+    if (me->fKms && me->fDev && me->fDisplay) {
+        struct NvKmsKapiDynamicDisplayParams *dd =
+            (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
+        if (dd) {
+            nvu_zero(dd, sizeof *dd); dd->handle = me->fDisplay;
+            IORecursiveLock *sl = startLock();
+            if (sl) IORecursiveLockLock(sl);
+            if (nvrmDynamicDisplayInfo(me->fKms, me->fDev, dd)) connected = dd->connected ? true : false;
+            if (sl) IORecursiveLockUnlock(sl);
+            IOFree(dd, sizeof *dd);
+        }
+    }
+    NVRMDisplayGate gate; if (!gate.valid()) return;
+    if (OSAddAtomic(0, &me->fStopping) || !me->fPowerOn || !me->fHeadSlept || !me->fModeSet || !me->fSurf) return;
+    if (!connected) {
+        FBLOG("display wake retry %u/%u: head %u display 0x%x still disconnected",
+              me->fWakeRetries, (unsigned)kNvrmWakeRetries, me->fHead, me->fDisplay);
+        me->scheduleWakeRetry();
+        return;
+    }
+    if (!me->setHeadPower(true)) me->scheduleWakeRetry();
 }
 IOReturn NVRMNVDAFramebuffer::setAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t value)
 {
